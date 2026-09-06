@@ -11,6 +11,7 @@ import android.content.Intent;
 import android.content.pm.ServiceInfo;
 import android.media.AudioAttributes;
 import android.media.AudioFormat;
+import android.media.AudioManager;
 import android.media.AudioPlaybackCaptureConfiguration;
 import android.media.AudioRecord;
 import android.media.projection.MediaProjection;
@@ -30,6 +31,8 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.io.RandomAccessFile;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.Locale;
@@ -49,13 +52,10 @@ public class CaptureService extends Service {
 
     private static final String CHANNEL_ID = "xplc_capture";
     private static final int NOTIFICATION_ID = 1701;
-    private static final int SAMPLE_RATE = 48_000;
     private static final int CHANNELS = 2;
-    private static final int BYTES_PER_SAMPLE = 2;
-    private static final int FRAME_BYTES = CHANNELS * BYTES_PER_SAMPLE;
-    private static final int SOUND_THRESHOLD = 160;
-    private static final long START_PADDING_BYTES = (long) SAMPLE_RATE * FRAME_BYTES * 350L / 1000L;
-    private static final long END_PADDING_BYTES = (long) SAMPLE_RATE * FRAME_BYTES * 700L / 1000L;
+    private static final int DEFAULT_SAMPLE_RATE = 48_000;
+    private static final float FLOAT_SOUND_THRESHOLD = 0.0015f;
+    private static final int PCM16_SOUND_THRESHOLD = 48;
 
     public static volatile boolean isRunning = false;
 
@@ -70,6 +70,12 @@ public class CaptureService extends Service {
     private long lastSoundByte = -1L;
     private long lastUiBroadcast = 0L;
     private long lastNotificationUpdate = 0L;
+
+    private int sampleRate = DEFAULT_SAMPLE_RATE;
+    private int encoding = AudioFormat.ENCODING_PCM_FLOAT;
+    private int bytesPerSample = 4;
+    private int frameBytes = CHANNELS * bytesPerSample;
+    private int captureBufferSize = 0;
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
@@ -104,7 +110,7 @@ public class CaptureService extends Service {
         startedAt = SystemClock.elapsedRealtime();
         startForeground(
                 NOTIFICATION_ID,
-                buildNotification("Ready for playback", 0L),
+                buildNotification("Preparing hi-res playback capture", 0L),
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
         );
 
@@ -133,142 +139,246 @@ public class CaptureService extends Service {
         AudioPlaybackCaptureConfiguration config =
                 new AudioPlaybackCaptureConfiguration.Builder(mediaProjection)
                         .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
-                        .addMatchingUsage(AudioAttributes.USAGE_GAME)
                         .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+                        .addMatchingUsage(AudioAttributes.USAGE_GAME)
                         .build();
 
-        int minBuffer = AudioRecord.getMinBufferSize(
-                SAMPLE_RATE,
-                AudioFormat.CHANNEL_IN_STEREO,
-                AudioFormat.ENCODING_PCM_16BIT
-        );
-        if (minBuffer <= 0) minBuffer = SAMPLE_RATE * FRAME_BYTES / 5;
-        int bufferSize = Math.max(minBuffer * 2, SAMPLE_RATE * FRAME_BYTES / 4);
+        sampleRate = resolveNativeOutputSampleRate();
 
-        AudioFormat format = new AudioFormat.Builder()
-                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                .setSampleRate(SAMPLE_RATE)
-                .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
-                .build();
-
-        audioRecord = new AudioRecord.Builder()
-                .setAudioFormat(format)
-                .setBufferSizeInBytes(bufferSize)
-                .setAudioPlaybackCaptureConfig(config)
-                .build();
-
-        if (audioRecord.getState() != AudioRecord.STATE_INITIALIZED) {
-            throw new IllegalStateException("AudioRecord failed to initialize");
+        boolean floatReady = configureRecorder(config, AudioFormat.ENCODING_PCM_FLOAT);
+        if (!floatReady) {
+            boolean pcm16Ready = configureRecorder(config, AudioFormat.ENCODING_PCM_16BIT);
+            if (!pcm16Ready) {
+                throw new IllegalStateException("AudioRecord failed to initialize in both hi-res and compatible modes");
+            }
         }
 
         rawFile = new File(getCacheDir(), "capture_" + System.currentTimeMillis() + ".pcm");
         stopRequested = false;
+        totalBytes = 0L;
+        firstSoundByte = -1L;
+        lastSoundByte = -1L;
+        lastUiBroadcast = 0L;
+        lastNotificationUpdate = 0L;
         isRunning = true;
-        broadcast(true, 0L, "Waiting for capturable audio…", null);
 
-        final int finalBufferSize = bufferSize;
-        recordingThread = new Thread(() -> recordLoop(finalBufferSize), "XPLC-Audio-Capture");
+        String mode = encoding == AudioFormat.ENCODING_PCM_FLOAT
+                ? "32-bit float / " + sampleRate / 1000.0 + " kHz stereo — waiting for audio…"
+                : "16-bit PCM / " + sampleRate / 1000.0 + " kHz stereo — waiting for audio…";
+        broadcast(true, 0L, mode, null);
+
+        recordingThread = new Thread(() -> {
+            if (encoding == AudioFormat.ENCODING_PCM_FLOAT) {
+                recordLoopFloat();
+            } else {
+                recordLoopPcm16();
+            }
+        }, "XPLC-HiRes-Capture");
         recordingThread.start();
     }
 
-    private void recordLoop(int bufferSize) {
-        byte[] buffer = new byte[bufferSize];
+    private boolean configureRecorder(AudioPlaybackCaptureConfiguration config, int requestedEncoding) {
+        try {
+            if (audioRecord != null) {
+                try {
+                    audioRecord.release();
+                } catch (Exception ignored) {
+                }
+                audioRecord = null;
+            }
+
+            int requestedBytes = requestedEncoding == AudioFormat.ENCODING_PCM_FLOAT ? 4 : 2;
+            int requestedFrameBytes = CHANNELS * requestedBytes;
+
+            int minBuffer = AudioRecord.getMinBufferSize(
+                    sampleRate,
+                    AudioFormat.CHANNEL_IN_STEREO,
+                    requestedEncoding
+            );
+            if (minBuffer <= 0) {
+                minBuffer = sampleRate * requestedFrameBytes / 4;
+            }
+
+            int bufferSize = Math.max(minBuffer * 4, sampleRate * requestedFrameBytes / 2);
+            bufferSize -= bufferSize % requestedFrameBytes;
+
+            AudioFormat format = new AudioFormat.Builder()
+                    .setEncoding(requestedEncoding)
+                    .setSampleRate(sampleRate)
+                    .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
+                    .build();
+
+            AudioRecord candidate = new AudioRecord.Builder()
+                    .setAudioFormat(format)
+                    .setBufferSizeInBytes(bufferSize)
+                    .setAudioPlaybackCaptureConfig(config)
+                    .build();
+
+            if (candidate.getState() != AudioRecord.STATE_INITIALIZED) {
+                candidate.release();
+                return false;
+            }
+
+            audioRecord = candidate;
+            encoding = requestedEncoding;
+            bytesPerSample = requestedBytes;
+            frameBytes = requestedFrameBytes;
+            captureBufferSize = bufferSize;
+            return true;
+        } catch (Exception e) {
+            if (audioRecord != null) {
+                try {
+                    audioRecord.release();
+                } catch (Exception ignored) {
+                }
+                audioRecord = null;
+            }
+            return false;
+        }
+    }
+
+    private int resolveNativeOutputSampleRate() {
+        try {
+            AudioManager audioManager = (AudioManager) getSystemService(AUDIO_SERVICE);
+            if (audioManager != null) {
+                String value = audioManager.getProperty(AudioManager.PROPERTY_OUTPUT_SAMPLE_RATE);
+                if (value != null) {
+                    int nativeRate = Integer.parseInt(value.trim());
+                    if (nativeRate >= 32_000 && nativeRate <= 48_000) {
+                        return nativeRate;
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return DEFAULT_SAMPLE_RATE;
+    }
+
+    private void recordLoopFloat() {
+        int floatCapacity = Math.max(CHANNELS * 2048, captureBufferSize / 4);
+        floatCapacity -= floatCapacity % CHANNELS;
+        float[] samples = new float[floatCapacity];
+        byte[] bytes = new byte[floatCapacity * 4];
+        ByteBuffer byteBuffer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN);
+
         String finalMessage = "Capture stopped.";
         Uri savedUri = null;
 
-        try (BufferedOutputStream rawOut = new BufferedOutputStream(new FileOutputStream(rawFile))) {
+        try (BufferedOutputStream rawOut = new BufferedOutputStream(new FileOutputStream(rawFile), 256 * 1024)) {
             audioRecord.startRecording();
 
             while (!stopRequested) {
-                int read = audioRecord.read(buffer, 0, buffer.length, AudioRecord.READ_BLOCKING);
+                int read = audioRecord.read(samples, 0, samples.length, AudioRecord.READ_BLOCKING);
                 if (read <= 0) continue;
 
-                long before = totalBytes;
-                rawOut.write(buffer, 0, read);
-                inspectSound(buffer, read, before);
-                totalBytes += read;
+                int alignedRead = read - (read % CHANNELS);
+                if (alignedRead <= 0) continue;
 
-                long now = SystemClock.elapsedRealtime();
-                if (now - lastUiBroadcast >= 900L) {
-                    lastUiBroadcast = now;
-                    String status = firstSoundByte >= 0
-                            ? "Capturing digital playback…"
-                            : "Waiting for capturable audio…";
-                    broadcast(true, now - startedAt, status, null);
+                byteBuffer.clear();
+                for (int i = 0; i < alignedRead; i++) {
+                    byteBuffer.putFloat(samples[i]);
                 }
-                if (now - lastNotificationUpdate >= 5000L) {
-                    lastNotificationUpdate = now;
-                    NotificationManager nm = getSystemService(NotificationManager.class);
-                    if (nm != null) {
-                        nm.notify(NOTIFICATION_ID,
-                                buildNotification(firstSoundByte >= 0 ? "Capturing internal audio" : "Waiting for audio",
-                                        now - startedAt));
-                    }
-                }
+
+                int byteCount = alignedRead * 4;
+                long before = totalBytes;
+                rawOut.write(bytes, 0, byteCount);
+                inspectSoundFloat(samples, alignedRead, before);
+                totalBytes += byteCount;
+                updateProgress();
             }
 
             rawOut.flush();
         } catch (Exception e) {
             finalMessage = "Capture error: " + safeMessage(e);
         } finally {
-            try {
-                if (audioRecord != null && audioRecord.getRecordingState() == AudioRecord.RECORDSTATE_RECORDING) {
-                    audioRecord.stop();
-                }
-            } catch (Exception ignored) {
-            }
-            try {
-                if (audioRecord != null) audioRecord.release();
-            } catch (Exception ignored) {
-            }
-            audioRecord = null;
-
-            if (firstSoundByte >= 0 && lastSoundByte > firstSoundByte && rawFile != null && rawFile.exists()) {
-                try {
-                    savedUri = saveTrimmedWav();
-                    if (savedUri != null) {
-                        finalMessage = "Saved WAV to Music/XPLC Capture.";
-                    }
-                } catch (Exception e) {
-                    finalMessage = "Couldn't save WAV: " + safeMessage(e);
-                }
-            } else if (!finalMessage.startsWith("Capture error")) {
-                finalMessage = "No capturable audio detected. Try playing Suno in Chrome; the source app may block playback capture.";
-            }
-
-            if (rawFile != null && rawFile.exists()) {
-                //noinspection ResultOfMethodCallIgnored
-                rawFile.delete();
-            }
-
-            isRunning = false;
-            stopRequested = true;
-            broadcast(false, SystemClock.elapsedRealtime() - startedAt, finalMessage,
-                    savedUri == null ? null : savedUri.toString());
-
-            try {
-                if (mediaProjection != null) mediaProjection.stop();
-            } catch (Exception ignored) {
-            }
-            mediaProjection = null;
-
-            stopForeground(STOP_FOREGROUND_REMOVE);
-            stopSelf();
+            finishCapture(finalMessage, savedUri);
         }
     }
 
-    private void inspectSound(byte[] buffer, int read, long absoluteStart) {
+    private void recordLoopPcm16() {
+        byte[] buffer = new byte[captureBufferSize];
+        String finalMessage = "Capture stopped.";
+        Uri savedUri = null;
+
+        try (BufferedOutputStream rawOut = new BufferedOutputStream(new FileOutputStream(rawFile), 256 * 1024)) {
+            audioRecord.startRecording();
+
+            while (!stopRequested) {
+                int read = audioRecord.read(buffer, 0, buffer.length, AudioRecord.READ_BLOCKING);
+                if (read <= 0) continue;
+
+                int alignedRead = read - (read % frameBytes);
+                if (alignedRead <= 0) continue;
+
+                long before = totalBytes;
+                rawOut.write(buffer, 0, alignedRead);
+                inspectSoundPcm16(buffer, alignedRead, before);
+                totalBytes += alignedRead;
+                updateProgress();
+            }
+
+            rawOut.flush();
+        } catch (Exception e) {
+            finalMessage = "Capture error: " + safeMessage(e);
+        } finally {
+            finishCapture(finalMessage, savedUri);
+        }
+    }
+
+    private void updateProgress() {
+        long now = SystemClock.elapsedRealtime();
+        if (now - lastUiBroadcast >= 900L) {
+            lastUiBroadcast = now;
+            String status = firstSoundByte >= 0
+                    ? captureModeLabel() + " — capturing raw digital playback…"
+                    : captureModeLabel() + " — waiting for capturable audio…";
+            broadcast(true, now - startedAt, status, null);
+        }
+        if (now - lastNotificationUpdate >= 5000L) {
+            lastNotificationUpdate = now;
+            NotificationManager nm = getSystemService(NotificationManager.class);
+            if (nm != null) {
+                nm.notify(NOTIFICATION_ID,
+                        buildNotification(firstSoundByte >= 0 ? captureModeLabel() : "Waiting for audio",
+                                now - startedAt));
+            }
+        }
+    }
+
+    private String captureModeLabel() {
+        String depth = encoding == AudioFormat.ENCODING_PCM_FLOAT ? "32-bit float" : "16-bit PCM";
+        String rate = sampleRate == 44_100 ? "44.1 kHz" : (sampleRate / 1000) + " kHz";
+        return depth + " • " + rate + " • stereo";
+    }
+
+    private void inspectSoundFloat(float[] samples, int count, long absoluteStart) {
         int first = -1;
         int last = -1;
+        for (int i = 0; i < count; i++) {
+            float sample = samples[i];
+            if (!Float.isNaN(sample) && !Float.isInfinite(sample) && Math.abs(sample) >= FLOAT_SOUND_THRESHOLD) {
+                if (first < 0) first = i;
+                last = i + 1;
+            }
+        }
+        if (first >= 0) {
+            long firstAbs = absoluteStart + (long) first * 4L;
+            long lastAbs = absoluteStart + (long) last * 4L;
+            if (firstSoundByte < 0) firstSoundByte = firstAbs;
+            lastSoundByte = lastAbs;
+        }
+    }
 
+    private void inspectSoundPcm16(byte[] buffer, int read, long absoluteStart) {
+        int first = -1;
+        int last = -1;
         for (int i = 0; i + 1 < read; i += 2) {
             int sample = (short) (((buffer[i + 1] & 0xFF) << 8) | (buffer[i] & 0xFF));
-            if (Math.abs(sample) >= SOUND_THRESHOLD) {
+            if (Math.abs(sample) >= PCM16_SOUND_THRESHOLD) {
                 if (first < 0) first = i;
                 last = i + 2;
             }
         }
-
         if (first >= 0) {
             long firstAbs = absoluteStart + first;
             long lastAbs = absoluteStart + last;
@@ -277,16 +387,68 @@ public class CaptureService extends Service {
         }
     }
 
+    private void finishCapture(String initialMessage, Uri ignored) {
+        String finalMessage = initialMessage;
+        Uri savedUri = null;
+
+        try {
+            if (audioRecord != null && audioRecord.getRecordingState() == AudioRecord.RECORDSTATE_RECORDING) {
+                audioRecord.stop();
+            }
+        } catch (Exception ignoredStop) {
+        }
+        try {
+            if (audioRecord != null) audioRecord.release();
+        } catch (Exception ignoredRelease) {
+        }
+        audioRecord = null;
+
+        if (firstSoundByte >= 0 && lastSoundByte > firstSoundByte && rawFile != null && rawFile.exists()) {
+            try {
+                savedUri = saveTrimmedWav();
+                if (savedUri != null) {
+                    finalMessage = "Saved " + captureModeLabel() + " WAV to Music/XPLC Capture. No EQ, gain, normalization or compression applied.";
+                }
+            } catch (Exception e) {
+                finalMessage = "Couldn't save WAV: " + safeMessage(e);
+            }
+        } else if (!finalMessage.startsWith("Capture error")) {
+            finalMessage = "No capturable audio detected. Try Suno in Chrome; the source app may block playback capture.";
+        }
+
+        if (rawFile != null && rawFile.exists()) {
+            //noinspection ResultOfMethodCallIgnored
+            rawFile.delete();
+        }
+
+        isRunning = false;
+        stopRequested = true;
+        broadcast(false, SystemClock.elapsedRealtime() - startedAt, finalMessage,
+                savedUri == null ? null : savedUri.toString());
+
+        try {
+            if (mediaProjection != null) mediaProjection.stop();
+        } catch (Exception ignoredProjection) {
+        }
+        mediaProjection = null;
+
+        stopForeground(STOP_FOREGROUND_REMOVE);
+        stopSelf();
+    }
+
     private Uri saveTrimmedWav() throws IOException {
-        long start = Math.max(0L, firstSoundByte - START_PADDING_BYTES);
-        long end = Math.min(totalBytes, lastSoundByte + END_PADDING_BYTES);
-        start -= start % FRAME_BYTES;
-        end -= end % FRAME_BYTES;
+        long startPaddingBytes = (long) sampleRate * frameBytes * 350L / 1000L;
+        long endPaddingBytes = (long) sampleRate * frameBytes * 900L / 1000L;
+
+        long start = Math.max(0L, firstSoundByte - startPaddingBytes);
+        long end = Math.min(totalBytes, lastSoundByte + endPaddingBytes);
+        start -= start % frameBytes;
+        end -= end % frameBytes;
         if (end <= start) return null;
 
         long dataLength = end - start;
         String timestamp = new SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.US).format(new Date());
-        String displayName = "XPLC_Capture_" + timestamp + ".wav";
+        String displayName = "XPLC_HiRes_" + timestamp + ".wav";
 
         ContentValues values = new ContentValues();
         values.put(MediaStore.Audio.Media.DISPLAY_NAME, displayName);
@@ -300,14 +462,14 @@ public class CaptureService extends Service {
 
         boolean success = false;
         try (OutputStream os = resolver.openOutputStream(uri, "w");
-             BufferedOutputStream out = os == null ? null : new BufferedOutputStream(os);
+             BufferedOutputStream out = os == null ? null : new BufferedOutputStream(os, 256 * 1024);
              RandomAccessFile raw = new RandomAccessFile(rawFile, "r")) {
 
             if (out == null) throw new IOException("Couldn't open output file");
             writeWavHeader(out, dataLength);
             raw.seek(start);
 
-            byte[] copy = new byte[64 * 1024];
+            byte[] copy = new byte[256 * 1024];
             long remaining = dataLength;
             while (remaining > 0) {
                 int wanted = (int) Math.min(copy.length, remaining);
@@ -332,18 +494,20 @@ public class CaptureService extends Service {
     }
 
     private void writeWavHeader(OutputStream out, long dataLength) throws IOException {
-        long byteRate = (long) SAMPLE_RATE * CHANNELS * BYTES_PER_SAMPLE;
+        long byteRate = (long) sampleRate * CHANNELS * bytesPerSample;
+        int formatCode = encoding == AudioFormat.ENCODING_PCM_FLOAT ? 3 : 1;
+
         writeAscii(out, "RIFF");
         writeLeInt(out, 36L + dataLength);
         writeAscii(out, "WAVE");
         writeAscii(out, "fmt ");
         writeLeInt(out, 16);
-        writeLeShort(out, 1);
+        writeLeShort(out, formatCode);
         writeLeShort(out, CHANNELS);
-        writeLeInt(out, SAMPLE_RATE);
+        writeLeInt(out, sampleRate);
         writeLeInt(out, byteRate);
-        writeLeShort(out, FRAME_BYTES);
-        writeLeShort(out, BYTES_PER_SAMPLE * 8);
+        writeLeShort(out, frameBytes);
+        writeLeShort(out, bytesPerSample * 8);
         writeAscii(out, "data");
         writeLeInt(out, dataLength);
     }
