@@ -38,22 +38,22 @@ jobs:
         run: gradle :app:assembleDebug --stacktrace
 
       - name: Name APK
-        run: cp app/build/outputs/apk/debug/app-debug.apk XPLC-Capture-v1.1.0.apk
+        run: cp app/build/outputs/apk/debug/app-debug.apk XPLC-Capture-v1.2.0.apk
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: XPLC-Capture-v1.1.0
-          path: XPLC-Capture-v1.1.0.apk
+          name: XPLC-Capture-v1.2.0
+          path: XPLC-Capture-v1.2.0.apk
 
       - name: Publish downloadable release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if gh release view v1.1.0 >/dev/null 2>&1; then
-            gh release upload v1.1.0 XPLC-Capture-v1.1.0.apk --clobber
+          if gh release view v1.2.0 >/dev/null 2>&1; then
+            gh release upload v1.2.0 XPLC-Capture-v1.2.0.apk --clobber
           else
-            gh release create v1.1.0 XPLC-Capture-v1.1.0.apk \
-              --title "XPLC Capture v1.1.0 — Hi-Res" \
-              --notes "Higher-fidelity Android internal playback capture. Prefers native-rate 32-bit float stereo PCM WAV and falls back to 16-bit PCM only when the device rejects float capture. No normalization, gain, EQ, compression, or microphone source."
+            gh release create v1.2.0 XPLC-Capture-v1.2.0.apk \
+              --title "XPLC Capture v1.2.0 — Auto Volume" \
+              --notes "Internal Android playback capture with native-rate 32-bit float stereo where supported, very-low-level signal detection, automatic peak recovery to -1 dBFS, +48 dB maximum gain, and a transparent safety limiter. Does not use microphone audio. If Android returns literal digital silence at media volume zero, no gain can recover it."
           fi
