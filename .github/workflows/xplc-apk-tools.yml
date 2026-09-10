@@ -1,0 +1,27 @@
+name: XPLC APK Tools
+on:
+  push:
+    branches:
+      - tooling/xplc-apk-tools
+jobs:
+  package-tools:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch apktool and jadx
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p tools
+          curl -fL --retry 3 -o tools/apktool_2.11.1.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.11.1/apktool_2.11.1.jar
+          curl -fL --retry 3 -o /tmp/jadx.zip https://github.com/skylot/jadx/releases/download/v1.5.6/jadx-1.5.6.zip
+          mkdir -p tools/jadx
+          unzip -q /tmp/jadx.zip -d tools/jadx
+          java -jar tools/apktool_2.11.1.jar --version
+          tools/jadx/bin/jadx --version
+      - name: Upload tooling bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: xplc-apk-tools
+          path: tools
+          if-no-files-found: error
+          retention-days: 1
