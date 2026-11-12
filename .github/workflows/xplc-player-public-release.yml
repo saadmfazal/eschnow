@@ -1,0 +1,150 @@
+name: Publish XPLC Player 3.2 Hybrid APK
+
+on:
+  push:
+    branches:
+      - xplc-player-download
+    paths:
+      - 'xplc31-src/**'
+      - 'xplc31-web-overlay/**'
+      - '.github/workflows/xplc-player-public-release.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reconstruct XPLC 3.1 source
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            cat xplc31-src/chunks/00
+            cat xplc31-src/chunks/01
+            cat xplc31-src/chunks/02
+            cat xplc31-src/chunks/03
+            cat xplc31-src/chunks/04
+            cat xplc31-src/chunks/06
+            cat xplc31-src/chunks/08
+            head -c 1105 xplc31-src/chunks/09a
+            printf 'i'
+            tail -c +1106 xplc31-src/chunks/09a
+            cat xplc31-src/chunks/09a-tail
+            cat xplc31-src/chunks/09b
+            cat xplc31-src/chunks/10
+          } > /tmp/xplc310.tar.xz.b64
+          test "$(wc -c < /tmp/xplc310.tar.xz.b64)" -eq 94752
+          base64 -d /tmp/xplc310.tar.xz.b64 > /tmp/xplc310.tar.xz
+          echo '95b9119fac5e5757b7c75d6b29a9500ce32bcf841e92a86843ce5d38309b0d4a  /tmp/xplc310.tar.xz' | sha256sum -c -
+          rm -rf xplc-player
+          mkdir -p xplc-player
+          tar -xJf /tmp/xplc310.tar.xz -C xplc-player
+          printf 'android.useAndroidX=true\nandroid.enableJetifier=true\n' > xplc-player/gradle.properties
+
+      - name: Apply hybrid local + web library overlay
+        shell: bash
+        run: |
+          set -euo pipefail
+          base64 -d xplc31-web-overlay/hybrid.patch.gz.b64 | gzip -dc > /tmp/hybrid.patch
+          cd xplc-player
+          patch -p1 --forward --batch < /tmp/hybrid.patch
+          python3 - <<'PY'
+          from pathlib import Path
+          base=Path('app/src/main/java/com/xplc/player')
+          for name in ('PlaylistLibraryActivity.java','PlaylistDetailActivity.java'):
+              p=base/name
+              s=p.read_text(encoding='utf-8')
+              needle='import androidx.media3.session.*;'
+              if needle in s and 'import androidx.media3.session.MediaController;' not in s:
+                  s=s.replace(needle, needle+'import androidx.media3.session.MediaController;', 1)
+                  p.write_text(s,encoding='utf-8')
+          p=base/'PlaybackService.java'
+          s=p.read_text(encoding='utf-8')
+          if 'import android.net.Uri;' not in s:
+              marker='import android.content.SharedPreferences;'
+              if marker not in s:
+                  raise SystemExit('PlaybackService import anchor missing')
+              s=s.replace(marker, marker+'import android.net.Uri;', 1)
+              p.write_text(s,encoding='utf-8')
+          PY
+          grep -q "versionName '3.2.0'" app/build.gradle
+          grep -q 'android.permission.INTERNET' app/src/main/AndroidManifest.xml
+          grep -q 'Sleep timer' app/src/main/java/com/xplc/player/MainActivity.java
+          grep -q 'LOCAL + WEB MUSIC' app/src/main/java/com/xplc/player/MainActivity.java
+          grep -q '/api/audio?catalog=1' app/src/main/java/com/xplc/player/WebMusicRepository.java
+
+      - name: Validate live EXPLIC catalog contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fLsS --retry 3 'https://explic-radio.vercel.app/api/audio?catalog=1' -o /tmp/catalog.json
+          python3 - <<'PY'
+          import json
+          d=json.load(open('/tmp/catalog.json'))
+          tracks=[x for x in d.get('tracks',[]) if x.get('enabled',True) and not x.get('stationId',False) and x.get('kind')!='station_id' and x.get('type')!='Station ID']
+          assert len(tracks) >= 200, len(tracks)
+          assert all(x.get('id') and x.get('src') for x in tracks)
+          assert all('title' in x and 'artist' in x for x in tracks)
+          print('Playable web tracks:', len(tracks))
+          PY
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Build signed release APK
+        working-directory: xplc-player
+        run: gradle :app:assembleRelease --stacktrace
+
+      - name: Verify and name APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC=xplc-player/app/build/outputs/apk/release/app-release.apk
+          OUT=XPLC-Player-3.2.0-Hybrid-Local-Web.apk
+          test -s "$SRC"
+          unzip -t "$SRC" >/dev/null
+          keytool -printcert -jarfile "$SRC" >/tmp/cert.txt
+          grep -q 'Owner:' /tmp/cert.txt
+          cp "$SRC" "$OUT"
+          sha256sum "$OUT" | tee XPLC-Player-3.2.0-Hybrid-Local-Web.sha256
+
+      - name: Publish public GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG='xplc-player-3.2.0-hybrid'
+          APK='XPLC-Player-3.2.0-Hybrid-Local-Web.apk'
+          SHA='XPLC-Player-3.2.0-Hybrid-Local-Web.sha256'
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$APK" "$SHA" --clobber
+          else
+            gh release create "$TAG" "$APK" "$SHA" \
+              --target "$GITHUB_SHA" \
+              --title 'XPLC Player 3.2 Hybrid' \
+              --notes 'Signed Android APK with local + EXPLIC web library support, web artwork/lyrics, offline catalog fallback, and sleep timer.'
+          fi
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: XPLC-Player-3.2.0-Hybrid-Local-Web-Signed-APK
+          path: |
+            XPLC-Player-3.2.0-Hybrid-Local-Web.apk
+            XPLC-Player-3.2.0-Hybrid-Local-Web.sha256
+          if-no-files-found: error
+          retention-days: 7
